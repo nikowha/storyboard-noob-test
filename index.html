@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Private test</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex">
+  <style>
+    :root { color-scheme: dark; }
+    html, body { height: 100%; margin: 0; background: #16181c; color: #dcdcdc; font: 15px/1.4 system-ui, sans-serif; }
+    #lock { height: 100%; display: flex; align-items: center; justify-content: center; }
+    #lock form { width: 280px; display: grid; gap: 10px; }
+    #lock input, #lock button { font: inherit; font-size: 16px; padding: 10px; border-radius: 6px; border: 1px solid #4a4a4a; background: #2b2b2b; color: inherit; }
+    #lock button { background: #4772b3; border-color: #4772b3; color: #fff; }
+    #message { min-height: 1.4em; color: #e88; }
+  </style>
+</head>
+<body>
+  <div id="lock">
+    <form id="lockForm">
+      <label for="accessCode">Access code</label>
+      <input id="accessCode" type="password" autocomplete="current-password" autocapitalize="off" required>
+      <button id="unlockButton" type="submit">Unlock</button>
+      <div id="message"></div>
+    </form>
+  </div>
+  <script type="module">
+    const STORED_KEY = 'storyboardNoobAccessKey';
+    const CONTENT_TYPES = { wasm: 'application/wasm', js: 'text/javascript', html: 'text/html' };
+    const elementById = (elementId) => document.getElementById(elementId);
+    const fromBase64 = (text) => Uint8Array.from(atob(text), (letter) => letter.charCodeAt(0));
+    const toBase64 = (bytes) => btoa(String.fromCharCode(...bytes));
+
+    // Dérive les 32 octets de la clé à partir du code.
+    async function deriveKeyBytes(code, meta) {
+      const baseKey = await crypto.subtle.importKey('raw', new TextEncoder().encode(code), 'PBKDF2', false, ['deriveBits']);
+      const parameters = { name: 'PBKDF2', hash: 'SHA-256', salt: fromBase64(meta.salt), iterations: meta.iterations };
+      return new Uint8Array(await crypto.subtle.deriveBits(parameters, baseKey, 256));
+    }
+
+    // Déchiffre l'archive, puis la décompresse.
+    async function decryptArchive(keyBytes, meta, encrypted) {
+      const key = await crypto.subtle.importKey('raw', keyBytes, 'AES-GCM', false, ['decrypt']);
+      const packed = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: fromBase64(meta.iv) }, key, encrypted);
+      const stream = new Blob([packed]).stream().pipeThrough(new DecompressionStream('gzip'));
+      return new Uint8Array(await new Response(stream).arrayBuffer());
+    }
+
+    // Sépare l'archive en fichiers.
+    function unpackFiles(bytes) {
+      const headerLength = new DataView(bytes.buffer, bytes.byteOffset).getUint32(0, true);
+      const index = JSON.parse(new TextDecoder().decode(bytes.subarray(4, 4 + headerLength)));
+      const start = 4 + headerLength;
+      const entries = Object.entries(index).map(([fileName, { offset, length }]) => [fileName, bytes.subarray(start + offset, start + offset + length)]);
+      return Object.fromEntries(entries);
+    }
+
+    // Fait répondre fetch avec les fichiers déchiffrés.
+    function serveFilesFromMemory(files) {
+      const networkFetch = window.fetch.bind(window);
+      window.fetch = (input, options) => {
+        const fileName = new URL(typeof input === 'string' ? input : input.url, location.href).pathname.split('/').pop();
+        if (!files[fileName]) return networkFetch(input, options);
+        const contentType = CONTENT_TYPES[fileName.split('.').pop()] ?? 'application/octet-stream';
+        return Promise.resolve(new Response(files[fileName], { headers: { 'Content-Type': contentType } }));
+      };
+    }
+
+    // Remplace l'écran de code par la page déchiffrée et lance son script.
+    async function startApplication(files) {
+      const page = new DOMParser().parseFromString(new TextDecoder().decode(files['index.html']), 'text/html');
+      page.querySelectorAll('script').forEach((scriptElement) => scriptElement.remove());
+      document.title = page.title;
+      document.head.querySelectorAll('style').forEach((styleElement) => styleElement.remove());
+      document.head.append(...page.head.querySelectorAll('style'));
+      document.body.replaceChildren(...page.body.childNodes);
+      serveFilesFromMemory(files);
+      await import(URL.createObjectURL(new Blob([files['app.js']], { type: 'text/javascript' })));
+    }
+
+    // Charge l'archive et ouvre la page avec la clé donnée.
+    async function openWith(keyBytes, meta) {
+      const response = await fetch('app.enc', { cache: 'no-cache' });
+      const bytes = await decryptArchive(keyBytes, meta, await response.arrayBuffer());
+      await startApplication(unpackFiles(bytes));
+    }
+
+    const meta = await (await fetch('app.enc.json', { cache: 'no-cache' })).json();
+    const storedKey = localStorage.getItem(STORED_KEY);
+    let isOpened = false;
+    if (storedKey) {
+      elementById('message').textContent = 'Loading…';
+      try { await openWith(fromBase64(storedKey), meta); isOpened = true; }
+      catch { localStorage.removeItem(STORED_KEY); elementById('message').textContent = ''; }
+    }
+
+    if (!isOpened) elementById('lockForm').addEventListener('submit', async (submitEvent) => {
+      submitEvent.preventDefault();
+      const message = elementById('message');
+      message.textContent = 'Loading…';
+      elementById('unlockButton').disabled = true;
+      try {
+        const keyBytes = await deriveKeyBytes(elementById('accessCode').value.trim(), meta);
+        await openWith(keyBytes, meta);
+        localStorage.setItem(STORED_KEY, toBase64(keyBytes));
+      } catch {
+        message.textContent = 'Wrong code.';
+        elementById('unlockButton').disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>
